@@ -25,6 +25,103 @@ from vllm.forward_context import get_forward_context
 from vllm_ascend.ascend_forward_context import MoECommType
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.distributed.utils import split_tensor_along_first_dim
+from vllm_ascend.ascend_config import get_ascend_config
+
+
+def dynamic_pruning_unsorted(
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    thresholds: torch.Tensor,
+    log2phy: torch.Tensor | None = None,
+    debug: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None,]:
+    """Drop weak top-k experts. Invalid logical id is -1 (not Omni's 512)."""
+    invalid_id = -1
+
+    topk_weight_sorted, sorted_indices = torch.sort(
+        topk_weights, dim=1, descending=True)
+    topk_id_sorted = torch.gather(topk_ids, dim=1, index=sorted_indices)
+    topk_weight_sum = torch.sum(topk_weight_sorted, dim=1, keepdim=True)
+    thr = thresholds.to(device=topk_weight_sorted.device,
+                        dtype=topk_weight_sorted.dtype)
+    if thr.numel() != topk_weights.shape[1]:
+        raise ValueError(
+            f"experts_pruning_threshold length {thr.numel()} "
+            f"!= top_k {topk_weights.shape[1]}")
+
+    weak_mask = (topk_weight_sorted < topk_weight_sum * thr)
+
+    if log2phy is not None:
+        valid_mask = topk_id_sorted >= 0
+        safe_ids = topk_id_sorted.clamp(min=0).long()
+
+        physical_ids = log2phy[safe_ids]
+
+        miss_mask = valid_mask & (physical_ids < 0)
+        prune_mask = weak_mask & miss_mask
+    else:
+        prune_mask = weak_mask
+    
+    debug_tensor = None
+    if debug and log2phy is not None:
+        invalid_ids = torch.full_like(topk_id_sorted, -1)
+        remaining_miss_mask = miss_mask & ~prune_mask
+        debug_tensor = torch.stack(
+            [
+                # [0] 剪枝前所有miss路由
+                torch.where(
+                    miss_mask,
+                    topk_id_sorted,
+                    invalid_ids,
+                ),
+                # [1] 被剪掉的路由
+                torch.where(
+                    prune_mask,
+                    topk_id_sorted,
+                    invalid_ids,
+                ),
+                # [2] 剪枝后仍保留、仍需H2D的miss路由
+                torch.where(
+                    remaining_miss_mask,
+                    topk_id_sorted,
+                    invalid_ids,
+                ),
+            ],
+            dim=0,
+        )
+
+    new_topk_weights = topk_weight_sorted.masked_fill(prune_mask, 0)
+    new_topk_ids = topk_id_sorted.masked_fill(prune_mask, invalid_id)
+    return new_topk_weights, new_topk_ids.to(topk_ids.dtype), debug_tensor
+
+
+_prune_thr_npu = None
+
+
+def maybe_prune_topk_experts(
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    log2phy: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None,]:
+    try:
+        cfg = get_ascend_config().expert_offload_config
+    except RuntimeError:
+        return topk_weights, topk_ids, None
+
+    if not cfg.experts_pruning_enabled:
+        return topk_weights, topk_ids, None
+
+    global _prune_thr_npu
+    if (_prune_thr_npu is None
+            or _prune_thr_npu.device != topk_weights.device
+            or _prune_thr_npu.dtype != topk_weights.dtype
+            or _prune_thr_npu.numel() != len(cfg.experts_pruning_threshold)):
+        _prune_thr_npu = torch.tensor(
+            cfg.experts_pruning_threshold,
+            device=topk_weights.device,
+            dtype=topk_weights.dtype,
+        )
+    return dynamic_pruning_unsorted(topk_weights, topk_ids, _prune_thr_npu, log2phy=log2phy, debug=cfg.experts_pruning_debug,)
 
 
 def select_experts(
@@ -187,12 +284,25 @@ def plan_expert_substitutions(
     upper = boundary * (1 + expert_substitution_threshold)
     lower = boundary * (1 - expert_substitution_threshold)
 
-    selected_scores = selection_scores.gather(1, topk_ids.long())
-    low_confidence = selected_scores < upper.unsqueeze(1)
-    in_cache = log2phy[topk_ids.long()] >= 0
+    # 剪枝后的-1不是有效专家，不能参与gather、log2phy索引和替换。
+    valid_routes = (
+        (topk_ids >= 0)
+        & (topk_ids < num_experts)
+    )
+
+    # gather不接受-1；log2phy[-1]还会错误读取最后一个专家。
+    safe_ids = topk_ids.clamp(
+        min=0,
+        max=num_experts - 1,
+    ).long()
+
+    selected_scores = selection_scores.gather(1, safe_ids)
+    low_confidence = (selected_scores < upper.unsqueeze(1)) & valid_routes
+    in_cache = valid_routes & (log2phy[safe_ids] >= 0)
+
     cached_experts = set(torch.where(log2phy >= 0)[0].tolist())
     references: dict[int, list[tuple[int, int]]] = {}
-    for token_idx, position in (~in_cache).nonzero(as_tuple=False).tolist():
+    for token_idx, position in (valid_routes & ~in_cache).nonzero(as_tuple=False).tolist():
         source_id = int(topk_ids[token_idx, position])
         referenced[source_id] = True
         references.setdefault(source_id, []).append((token_idx, position))
