@@ -1,6 +1,7 @@
 """Expert Offload Manager — manages CPU-side expert weights and NPU paging."""
 
 import logging
+import json
 import os
 import threading
 import time
@@ -26,6 +27,7 @@ from vllm_ascend.ops.fused_moe.experts_selector import (
     commit_expert_substitutions,
     plan_expert_substitutions,
     substitute_experts,
+    maybe_prune_topk_experts,
 )
 from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ
 
@@ -191,6 +193,8 @@ class ExpertOffloadManager:
         # Flipping it on surfaces them at info level (no need for global
         # VLLM_LOGGING_LEVEL=DEBUG).
         self._debug = self.offload_config.moe_offload_debug
+        self._prune_activity_logged = False
+        self._prune_debug = self.offload_config.experts_pruning_debug
         # Graph/collective diagnostics. Host callbacks may execute on report
         # threads, so keep the counters under a small CPU-only lock. These
         # fields are touched only when moe_offload_debug is enabled and never
@@ -629,6 +633,12 @@ class ExpertOffloadManager:
         self.topk_weights_h = torch.zeros(
             [self.offload_threshold, self.topk],
             dtype=torch.float32, device="cpu", pin_memory=True)
+        self.prune_debug_h = torch.zeros(
+            [self.offload_threshold, 3, self.topk],
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=True,
+        )
         self.router_logits_h = None
         self.e_score_correction_bias_h = None
         if self.offload_config.expert_substitution_enabled:
@@ -1615,6 +1625,33 @@ class ExpertOffloadManager:
         if npu_event is not None:
             torch_npu.npu.current_stream().wait_event(npu_event)
 
+        prune_debug = None
+        if (self.offload_config.experts_pruning_enabled
+            and topk_weights is not None):
+            logger.info_once(
+                "[EXPERT-PRUNE] entered NPU pruning path: "
+                "topk=%d thresholds=%s",
+                self.topk,
+                tuple(self.offload_config.experts_pruning_threshold),
+            )
+            pruned_weights, pruned_ids, prune_debug = maybe_prune_topk_experts(
+                topk_weights,
+                topk_ids,
+                log2phy=log2phy,
+            )
+            # 必须原地写回，因为w4a8.py仍然持有原Tensor。
+            topk_weights.copy_(pruned_weights)
+            topk_ids.copy_(pruned_ids)
+        prune_debug_h = None
+        if prune_debug is not None:
+            prune_debug_npu = prune_debug.permute(
+                1, 0, 2
+            ).contiguous()
+            prune_debug_h = self.prune_debug_h[:num_tokens]
+            prune_debug_h.copy_(
+                prune_debug_npu,
+                non_blocking=_EXTRA_CTX.capturing,
+            )
         topk_ids_h = self.topk_ids_h[:num_tokens]
         do_substitution = (
             self.offload_config.expert_substitution_enabled
@@ -1668,6 +1705,7 @@ class ExpertOffloadManager:
             router_logits_h,
             scoring_func,
             correction_bias_h,
+            prune_debug_h
         )
         if _EXTRA_CTX.capturing:
             torch_npu.npu._launch_host_func(
@@ -2685,10 +2723,62 @@ class ExpertOffloadManager:
             router_logits_h = None
             scoring_func = "softmax"
             correction_bias_h = None
+            prune_debug_h = None
         else:
             (topk_ids_h, log2phy_np, layer, layer_idx, topk_weights_h,
              is_prefetch, do_substitution, router_logits_h, scoring_func,
-             correction_bias_h) = args
+             correction_bias_h, prune_debug_h) = args
+                
+        if (
+            self.offload_config.experts_pruning_enabled
+            and not is_prefetch
+            and prune_debug_h is not None
+        ):
+            miss_routes = [
+                int(x)
+                for x in prune_debug_h[:, 0, :].reshape(-1).tolist()
+                if int(x) >= 0
+            ]
+            pruned_routes = [
+                int(x)
+                for x in prune_debug_h[:, 1, :].reshape(-1).tolist()
+                if int(x) >= 0
+            ]
+            remaining_routes = [
+                int(x)
+                for x in prune_debug_h[:, 2, :].reshape(-1).tolist()
+                if int(x) >= 0
+            ]
+            # miss_routes：剪枝前所有miss的路由，一次forward （4个token）的所有专家路由，会有重复
+            # pruned_routes： 被剪掉的路由，同理会有重复
+            # remaining_routes： 剪枝后仍保留、仍需H2D的miss路由
+            miss_ids = sorted(set(miss_routes))
+            pruned_ids = sorted(set(pruned_routes))
+            saved_h2d_ids = sorted(
+                set(miss_routes) - set(remaining_routes)
+            )
+            prune_record = {
+                "layer": layer_idx,
+                "num_tokens": topk_ids_h.shape[0],
+                "miss_ids": miss_ids,
+                "miss_count": len(miss_ids),
+                "miss_routes": len(miss_routes),
+                "pruned_ids": pruned_ids,
+                "pruned_unique_count": len(pruned_ids),
+                "pruned_routes": len(pruned_routes),
+                "remaining_miss_ids": sorted(set(remaining_routes)),
+                "saved_h2d_ids": saved_h2d_ids,
+                "saved_h2d_count": len(saved_h2d_ids),
+            }
+            logger.info(
+                "[EXPERT-PRUNE-LAYER-JSON] %s",
+                json.dumps(
+                    prune_record,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ),
+            )
+
         if do_substitution:
             original_ids = (
                 topk_ids_h[:, :self.topk].clone()
@@ -2710,15 +2800,21 @@ class ExpertOffloadManager:
         with torch_npu.npu.stream(self.load_stream):
             # Hotness observation only on the reactive (non-prefetch) H2D path
             # with LRC policy enabled.
+            def _valid_eids(ids_t):
+                return [e for e in ids_t.reshape(-1).tolist()
+                        if 0 <= e < self.num_total_experts]
+
             if not is_prefetch and self.cache_policy is not None:
+                id_rows = topk_ids_h.tolist()
                 router_scores = topk_weights_h.tolist() if topk_weights_h is not None else None
+
                 needed = self.cache_policy.observe(
                     layer_idx,
-                    topk_ids_h.tolist(),
+                    id_rows,
                     router_scores=router_scores,
                 )
             else:
-                needed = set(topk_ids_h.reshape(-1).tolist())
+                needed = set(_valid_eids(topk_ids_h))
 
             l2p_list = log2phy_np.tolist()
             slot_owner = {s: e for e, s in enumerate(l2p_list) if s >= 0}
@@ -2726,7 +2822,7 @@ class ExpertOffloadManager:
 
             if is_prefetch:
                 # Prefetch: only load the truly-missing top-N predicted experts.
-                ordered_misses = [e for e in topk_ids_h.reshape(-1).tolist() if e not in on_device]
+                ordered_misses = [e for e in _valid_eids(topk_ids_h) if e not in on_device]
                 need_to_load = set(ordered_misses[:self.prefetch_topk])
             else:
                 need_to_load = needed - on_device
@@ -2739,7 +2835,7 @@ class ExpertOffloadManager:
 
             if self._debug:
                 flag = '[PREFETCH-W]' if is_prefetch else '[UPDATE-W]'
-                already_there_layer = set(topk_ids_h[0].tolist()) & on_device
+                already_there_layer = (set(_valid_eids(topk_ids_h[0:1])) & on_device)
                 logger.info("%s l=%d expert_hit=%s expert_miss=%s hit_rate=%.2f layer_expert_hit=%s needed=%s topk_ids_h=%s" ,
                             flag,layer_idx, sorted(already_there),
                             # sorted(need_to_load), len(already_there_layer) / topk_ids_h.shape[1],
@@ -2780,7 +2876,7 @@ class ExpertOffloadManager:
                             layer_idx, len(need_to_load) - n_copies,
                             sorted(list(need_to_load))[n_copies:][:20])
                     break  # no free slots — should not happen in normal usage
-                
+
                 planned_loads.append((slot, eid))
                 # Update mapping
                 if victim is None:
@@ -2988,7 +3084,7 @@ class ExpertOffloadManager:
         topk_ids_h, topk_weights_h, log2phy_h, log2phy_np, next_layer, next_idx = staged
 
         ready_to_load_event = torch_npu.npu.Event()
-        torch_npu.npu.current_stream().record_event(ready_to_load_event) 
+        torch_npu.npu.current_stream().record_event(ready_to_load_event)
         with torch_npu.npu.stream(self._prefetch_stream):
             self._prefetch_stream.wait_event(ready_to_load_event)
             current_compute_stream = torch_npu.npu.current_stream()
@@ -3003,7 +3099,7 @@ class ExpertOffloadManager:
 
             def _prefetch_host_cb(_args):
                 prefetch_fn(_args)
-                
+
 
             if _EXTRA_CTX.capturing:
                 if self.enable_multi_card:
